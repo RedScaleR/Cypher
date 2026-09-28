@@ -175,7 +175,7 @@ function Util.parseKey(key)
 	if key == nil or key == false or key == "none" or key == "None" or key == "" then return nil end
 	if typeof(key) == "EnumItem" then
 		if key.EnumType == Enum.KeyCode then
-			if key == Enum.KeyCode.Unknown then return nil end
+			if key.Value == 0 then return nil end -- KeyCode.Unknown / KeyCode.None (its new name)
 			return key
 		end
 		if key.EnumType == Enum.UserInputType then return key end
@@ -1530,7 +1530,8 @@ end
 
 -- Keyboard / gamepad keys come back as KeyCode, mouse buttons as UserInputType
 local function inputKey(input)
-	if input.KeyCode ~= Enum.KeyCode.Unknown then return input.KeyCode end
+	-- value 0 is "no key" (Enum.KeyCode.Unknown, renamed Enum.KeyCode.None); compare the value so both work
+	if input.KeyCode.Value ~= 0 then return input.KeyCode end
 	return input.UserInputType
 end
 
