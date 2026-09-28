@@ -1,5 +1,5 @@
 local Cipher = {
-	Version = "1.0.0",
+	Version = "1.1.0",
 	Flags = {},        -- flag -> current value
 	Options = {},      -- flag -> element object
 	Themes = {},
@@ -543,6 +543,7 @@ function Cipher:SetTheme(theme, instant)
 		warn("[Cipher] unknown theme: " .. tostring(theme))
 		return false
 	end
+	local old = self.Theme
 	local new = Util.copy(self.Themes.Matrix)
 	for k, v in pairs(data) do
 		if typeof(v) == "Color3" then new[k] = v end
@@ -555,12 +556,20 @@ function Cipher:SetTheme(theme, instant)
 		if b.obj.Parent == nil then
 			table.remove(ThemeBinds, i)
 		else
-			local goal = {}
-			for prop, key in pairs(b.props) do goal[prop] = new[key] end
-			if instant then
-				for prop, value in pairs(goal) do b.obj[prop] = value end
-			else
-				tween(b.obj, 0.35, goal, Enum.EasingStyle.Quad)
+			-- only touch colours that actually changed (keeps per-frame rainbow accents cheap)
+			local goal, changed = {}, false
+			for prop, key in pairs(b.props) do
+				if new[key] ~= old[key] then
+					goal[prop] = new[key]
+					changed = true
+				end
+			end
+			if changed then
+				if instant then
+					for prop, value in pairs(goal) do b.obj[prop] = value end
+				else
+					tween(b.obj, 0.35, goal, Enum.EasingStyle.Quad)
+				end
 			end
 		end
 	end
@@ -573,7 +582,7 @@ function Cipher:SetTheme(theme, instant)
 			if not ok then warn("[Cipher] theme hook error: " .. tostring(err)) end
 		end
 	end
-	for _, fn in ipairs(self._themeListeners) do safeCall(fn, name, new) end
+	for _, fn in ipairs(Util.copy(self._themeListeners)) do safeCall(fn, name, new) end
 	return true
 end
 
@@ -588,16 +597,29 @@ function Cipher:SetAccent(color, instant)
 	return self:SetTheme(custom, instant)
 end
 
+Cipher._themeDropdowns = {} -- settings-tab theme pickers, refreshed by AddTheme
+
 function Cipher:AddTheme(name, data)
 	assert(type(name) == "string", "AddTheme: name must be a string")
 	assert(type(data) == "table", "AddTheme: data must be a table")
 	self.Themes[name] = data
 	if not Util.find(self.ThemeOrder, name) then table.insert(self.ThemeOrder, name) end
+	for _, drop in ipairs(self._themeDropdowns) do
+		if not drop._destroyed then drop:Refresh(self.ThemeOrder) end
+	end
 	return data
 end
 
+-- returns a handle with :Disconnect()
 function Cipher:OnThemeChanged(fn)
-	table.insert(self._themeListeners, fn)
+	local listeners = self._themeListeners
+	table.insert(listeners, fn)
+	return {
+		Disconnect = function()
+			local i = Util.find(listeners, fn)
+			if i then table.remove(listeners, i) end
+		end,
+	}
 end
 
 --============================================================
@@ -651,7 +673,9 @@ local function getOverlay()
 	New("UISizeConstraint", { MaxSize = Vector2.new(260, math.huge), Parent = Overlay.TooltipText })
 	Overlay.TooltipText.TextWrapped = true
 
-	track(RunService.RenderStepped:Connect(function()
+	-- the overlay can be rebuilt (e.g. notify after unload); don't leave the old follower running
+	if Overlay.Conn then Overlay.Conn:Disconnect() end
+	Overlay.Conn = track(RunService.RenderStepped:Connect(function()
 		local tip = Overlay.Tooltip
 		if tip and tip.Visible then
 			local mouse = UserInputService:GetMouseLocation()
@@ -710,8 +734,15 @@ local NotifOrder = 0
 local ActiveNotifs = {}
 local MAX_NOTIFS = 6
 
-function Cipher:Notify(opts)
-	if type(opts) == "string" then opts = { Content = opts } end
+-- Cipher:Notify("text")  /  Cipher:Notify("title", "text", "success", 5)  /  Cipher:Notify({ ... })
+function Cipher:Notify(opts, text, notifType, seconds)
+	if type(opts) == "string" then
+		if text ~= nil then
+			opts = { Title = opts, Content = text, Type = notifType, Duration = seconds }
+		else
+			opts = { Content = opts }
+		end
+	end
 	opts = opts or {}
 	local kind = NOTIF_TYPES[string.lower(tostring(opts.Type or "info"))] or NOTIF_TYPES.info
 	local duration = tonumber(opts.Duration) or 5
@@ -910,6 +941,19 @@ function Cipher:Notify(opts)
 	return notif
 end
 
+-- when the last window goes (closed, or replaced by a re-executed script) the overlay gui would
+-- linger forever; drop it once its notifications are gone (Notify / tooltips rebuild it on demand)
+local function releaseOverlayWhenIdle()
+	task.spawn(function()
+		while #ActiveNotifs > 0 do task.wait(0.5) end
+		task.wait(0.6) -- let the last dismiss animation finish
+		if #Cipher.Windows > 0 or #ActiveNotifs > 0 or not Overlay.Gui then return end
+		if Overlay.Conn then Overlay.Conn:Disconnect() Overlay.Conn = nil end
+		pcall(function() Overlay.Gui:Destroy() end)
+		Overlay.Gui = nil
+	end)
+end
+
 --============================================================
 -- WINDOW
 --============================================================
@@ -942,7 +986,9 @@ local function sizeToVector(size)
 	return 660, 450
 end
 
+-- Cipher:CreateWindow("TITLE")  or  Cipher:CreateWindow({ Title = "TITLE", ... })
 function Cipher:CreateWindow(opts)
+	if type(opts) == "string" then opts = { Title = opts } end
 	opts = opts or {}
 	local title = tostring(opts.Title or opts.Name or "CIPHER")
 	local W, H = sizeToVector(opts.Size)
@@ -982,6 +1028,8 @@ function Cipher:CreateWindow(opts)
 		self.ToggleKey = Util.parseKey(opts.ToggleKey) or Enum.KeyCode.RightShift
 	end
 	self.ConfirmClose = opts.ConfirmClose ~= false
+	-- keybinds skip input Roblox already used (menus, the game's own binds); the menu key still works
+	self.IgnoreGameProcessed = opts.IgnoreGameProcessed == true
 
 	table.insert(Cipher.Windows, self)
 	genv.__CIPHER_WINDOWS[title] = self
@@ -1055,8 +1103,8 @@ function Cipher:CreateWindow(opts)
 
 	local led = New("Frame", { Size = UDim2.fromOffset(7, 7), ZIndex = 3, LayoutOrder = 1, Theme = { BackgroundColor3 = "Accent" }, Parent = titleGroup })
 	Corner(led, 2)
-	local ledTween = TweenService:Create(led, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { BackgroundTransparency = 0.75 })
-	ledTween:Play()
+	self._ledTween = TweenService:Create(led, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { BackgroundTransparency = 0.75 })
+	self._ledTween:Play()
 
 	self.TitleLabel = New("TextLabel", {
 		AutomaticSize = Enum.AutomaticSize.X,
@@ -1420,6 +1468,9 @@ function Cipher:CreateWindow(opts)
 	self:_setupInput()
 	self:_setupStatus()
 	self:_setupAutoScale()
+	-- re-centre now that the auto-scale is known, so small screens don't push the topbar off the top
+	self._openPos = self:_clampPosition(self:_centerPosition())
+	holder.Position = self._openPos
 	self:_setupBlink()
 	self:_setupMobile(opts.MobileButton)
 	self:_registerBuiltinCommands()
@@ -1437,8 +1488,23 @@ function Cipher:CreateWindow(opts)
 		end
 	end)
 
+	-- runs before the script builds its tabs: values for elements that don't exist yet are kept
+	-- and applied the moment each flagged element is created (see register)
+	if opts.AutoLoadConfig then
+		local name = Cipher:GetAutoload()
+		if name then
+			local ok, err = Cipher:LoadConfig(name)
+			if ok then
+				Cipher:Notify({ Title = "config", Content = "autoloaded '" .. name .. "'", Type = "success", Duration = 3 })
+			else
+				warn("[Cipher] autoload failed: " .. tostring(err))
+			end
+		end
+	end
+
 	return self
 end
+Cipher.Window = Cipher.CreateWindow
 
 --============================================================
 -- WINDOW BEHAVIOUR
@@ -1449,6 +1515,17 @@ end
 
 local function isMove(input)
 	return input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch
+end
+
+-- InputObject.Position is measured below the topbar inset, but every Cipher gui uses
+-- IgnoreGuiInset (AbsolutePosition from the very top of the screen). Only matters for Y.
+local GuiService = getService("GuiService")
+local function screenPoint(input)
+	if input.UserInputType ~= Enum.UserInputType.Touch then
+		return UserInputService:GetMouseLocation()
+	end
+	local ok, inset = pcall(function() return GuiService:GetGuiInset() end)
+	return Vector2.new(input.Position.X, input.Position.Y + ((ok and inset) and inset.Y or 0))
 end
 
 -- Keyboard / gamepad keys come back as KeyCode, mouse buttons as UserInputType
@@ -1478,7 +1555,7 @@ function Window:_setupDragging()
 	track(UserInputService.InputChanged:Connect(function(input)
 		if dragging and isMove(input) then
 			local delta = input.Position - dragStart
-			self._dragTarget = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+			self._dragTarget = self:_clampPosition(UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y))
 		end
 	end), self._connections)
 
@@ -1532,7 +1609,7 @@ function Window:_setupResizing()
 end
 
 function Window:_setupInput()
-	track(UserInputService.InputBegan:Connect(function(input)
+	track(UserInputService.InputBegan:Connect(function(input, processed)
 		if self.Destroyed then return end
 		if input.UserInputType == Enum.UserInputType.MouseMovement then return end
 		local key = inputKey(input)
@@ -1549,6 +1626,7 @@ function Window:_setupInput()
 		if self.ToggleKey and key == self.ToggleKey then
 			self:Toggle()
 		end
+		if processed and self.IgnoreGameProcessed then return end
 		for _, kb in ipairs(self.Keybinds) do
 			local ok, err = pcall(kb._press, kb, key)
 			if not ok then warn("[Cipher] keybind error: " .. tostring(err)) end
@@ -1586,6 +1664,33 @@ function Window:_updateScale()
 	if vp.X < 50 or vp.Y < 50 then return end
 	local fit = math.min(1, (vp.X - 24) / self.Width, (vp.Y - 24) / self.Height)
 	self.UIScale.Scale = math.max(0.4, fit) * self._userScale
+	-- a rotated / resized screen must not strand the window outside the viewport
+	if self._openPos and not self._animating and not self._dragTarget then
+		self._openPos = self:_clampPosition(self._openPos)
+		if self.Visible then self.Holder.Position = self._openPos end
+	end
+end
+
+-- UIScale scales around the holder's top-centre anchor, so the visual height is Height * Scale
+function Window:_centerPosition()
+	local scale = self.UIScale and self.UIScale.Scale or 1
+	return UDim2.new(0.5, 0, 0.5, -math.floor(self.Height * scale / 2))
+end
+
+-- keeps the topbar on screen and at least a strip of the window reachable horizontally
+function Window:_clampPosition(pos)
+	local cam = workspace.CurrentCamera
+	if not cam then return pos end
+	local vp = cam.ViewportSize
+	if vp.X < 50 or vp.Y < 50 then return pos end
+	local scale = self.UIScale.Scale
+	local halfW = self.Width * scale / 2
+	local keep = math.min(80, halfW)
+	local x = pos.X.Scale * vp.X + pos.X.Offset -- top-centre of the holder, in pixels
+	local y = pos.Y.Scale * vp.Y + pos.Y.Offset
+	x = Util.clamp(x, keep - halfW, vp.X - keep + halfW)
+	y = Util.clamp(y, 0, math.max(0, vp.Y - TOPBAR_H * scale))
+	return UDim2.new(pos.X.Scale, math.floor(x - pos.X.Scale * vp.X + 0.5), pos.Y.Scale, math.floor(y - pos.Y.Scale * vp.Y + 0.5))
 end
 
 function Window:_setupAutoScale()
@@ -1700,7 +1805,8 @@ function Window:_animateOpen()
 	local pos = self._openPos
 	holder.Visible = true
 	holder.Size = UDim2.fromOffset(0, 2)
-	holder.Position = pos + UDim2.fromOffset(0, half)
+	-- the holder lives in screen space (unscaled), the canvas inside it is scaled by UIScale
+	holder.Position = pos + UDim2.fromOffset(0, math.floor(half * self.UIScale.Scale))
 	canvas.Position = UDim2.new(0.5, 0, 0, -half)
 	tween(holder, 0.22, { Size = UDim2.fromOffset(self.Width, 2) }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 	task.delay(0.22, function()
@@ -1723,7 +1829,8 @@ function Window:_animateClose(done)
 	self._animating = true
 	local holder, canvas = self.Holder, self.Canvas
 	local half = math.max(0, math.floor(holder.Size.Y.Offset / 2) - 1)
-	tween(holder, 0.2, { Size = UDim2.fromOffset(self.Width, 2), Position = self._openPos + UDim2.fromOffset(0, half) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+	local screenHalf = math.floor(half * self.UIScale.Scale)
+	tween(holder, 0.2, { Size = UDim2.fromOffset(self.Width, 2), Position = self._openPos + UDim2.fromOffset(0, screenHalf) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
 	tween(canvas, 0.2, { Position = UDim2.new(0.5, 0, 0, -half) }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
 	task.delay(0.2, function()
 		if id ~= self._animId then return end
@@ -1819,7 +1926,15 @@ function Window:SetVisible(state)
 	if state == self.Visible or self.Destroyed then return end
 	self.Visible = state
 	Tooltip.hide()
+	self:_closePopup()
 	if state then self:_animateOpen() else self:_animateClose() end
+end
+
+-- floating panels (toggle colour pickers) close when their anchor moves or disappears
+function Window:_closePopup()
+	local popup = self._popup
+	self._popup = nil
+	if popup then pcall(popup.Close) end
 end
 
 function Window:Toggle()
@@ -1831,6 +1946,7 @@ function Window:SetMinimized(state)
 	if state == self.Minimized then return end
 	self.Minimized = state
 	self._minBtn.Text = state and "+" or "-"
+	if state then self:_closePopup() end
 	if not self.Visible then return end
 	tween(self.Holder, 0.4, { Size = UDim2.fromOffset(self.Width, state and TOPBAR_H or self.Height) }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 end
@@ -1845,16 +1961,23 @@ function Window:SetSize(w, h, fromGrip)
 	if not self._animating then
 		self.Holder.Size = UDim2.fromOffset(w, self.Minimized and TOPBAR_H or h)
 	end
+	self:_closePopup()
+	self:_relayoutColumns()
 	if not fromGrip then self:_updateScale() end
 end
 
 function Window:SetScale(scale)
 	self._userScale = Util.clamp(tonumber(scale) or 1, 0.4, 2)
 	self:_updateScale()
+	-- keep the settings slider in sync when the scale comes from code or a config
+	local slider = self._scaleSlider
+	if slider and not slider._destroyed then
+		slider:Set(math.floor(self._userScale * 100 + 0.5), true)
+	end
 end
 
 function Window:Center()
-	local pos = UDim2.new(0.5, 0, 0.5, -math.floor(self.Height / 2))
+	local pos = self:_centerPosition()
 	self._openPos = pos
 	self._dragTarget = nil
 	if not self._animating then self.Holder.Position = pos end
@@ -1872,14 +1995,18 @@ end
 
 function Window:SetToggleKey(key)
 	self.ToggleKey = Util.parseKey(key)
+	local kb = self._menuKeybind
+	if kb and not kb._destroyed and kb.Value ~= self.ToggleKey then
+		kb:Set(self.ToggleKey, true)
+	end
 end
 
 function Window:SetScanline(state)
 	self._sweep.Visible = state and true or false
 end
 
-function Window:Notify(opts)
-	return Cipher:Notify(opts)
+function Window:Notify(...)
+	return Cipher:Notify(...)
 end
 
 function Window:OnDestroy(fn)
@@ -1900,6 +2027,8 @@ function Window:Destroy(instant)
 	local function finish()
 		for _, conn in ipairs(self._connections) do pcall(function() conn:Disconnect() end) end
 		self._connections = {}
+		-- infinitely-looping tweens would otherwise outlive the gui
+		for _, t in ipairs({ self._ledTween, self._sweepTween }) do pcall(function() t:Cancel() end) end
 		for flag, element in pairs(self._flags) do
 			if Cipher.Options[flag] == element then
 				Cipher.Options[flag] = nil
@@ -1911,6 +2040,7 @@ function Window:Destroy(instant)
 		end
 		pcall(function() self.Gui:Destroy() end)
 		for _, fn in ipairs(self._onDestroy or {}) do safeCall(fn) end
+		if #Cipher.Windows == 0 then releaseOverlayWhenIdle() end
 	end
 
 	local idx = Util.find(Cipher.Windows, self)
@@ -1954,14 +2084,15 @@ local function newClass()
 end
 
 --------------------------------------------------------------- tabs
-function Window:AddTab(opts)
-	if type(opts) == "string" then opts = { Name = opts } end
-	opts = opts or {}
+-- Window:AddTab("Main")  /  Window:AddTab("Main", ">", "description")  /  Window:AddTab({ Name, Icon, Description, Columns })
+function Window:AddTab(opts, tabIcon, tabDescription)
+	if type(opts) ~= "table" then opts = { Name = opts, Icon = tabIcon, Description = tabDescription } end
 	self._elements = self._elements or {}
 
 	local tab = setmetatable({}, Tab)
 	tab.Name = tostring(opts.Name or opts.Title or ("tab" .. (#self.Tabs + 1)))
 	tab.Description = opts.Description
+	tab.Columns = (tonumber(opts.Columns) or 1) >= 2 and 2 or 1
 	tab.Window = self
 	tab._window = self
 	tab._tab = tab
@@ -2020,12 +2151,29 @@ function Window:AddTab(opts)
 		ZIndex = 4,
 		Parent = btn,
 	})
+	-- search hit counter, shown while the sidebar search box has text
+	local count = New("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -8, 0.5, 0),
+		Size = UDim2.fromOffset(24, 16),
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Visible = false,
+		ZIndex = 4,
+		Theme = { TextColor3 = "Accent" },
+		Parent = btn,
+	})
 
 	local hovering = false
 	function tab._render(instant)
 		local t = Cipher.Theme
 		local selected = self.CurrentTab == tab
+		local hits = tab._searchHits -- nil when not searching
 		local color = selected and t.Accent or (hovering and t.Text or t.SubText)
+		if hits == 0 and not selected and not hovering then color = t.Muted end
+		count.Visible = hits ~= nil and hits > 0
+		count.Text = count.Visible and tostring(hits) or ""
+		label.Size = UDim2.new(1, -(20 + iconPad + (count.Visible and 26 or 0)), 1, 0)
 		local goals = {
 			{ btn, { BackgroundTransparency = selected and 0.9 or (hovering and 0.96 or 1) } },
 			{ label, { TextColor3 = color, Position = UDim2.fromOffset((selected and 16 or 12) + iconPad, 0) } },
@@ -2046,7 +2194,7 @@ function Window:AddTab(opts)
 	btn.MouseLeave:Connect(function() hovering = false tab._render() end)
 	btn.MouseButton1Click:Connect(function() self:SelectTab(tab) end)
 	Tooltip.attach(btn, opts.Description)
-	tab.Button = btn
+	tab.TabButton = btn -- (not "Button": tab:Button("name", fn) is the shorthand for a button element)
 
 	local page = New("ScrollingFrame", {
 		Size = UDim2.fromScale(1, 1),
@@ -2067,9 +2215,88 @@ function Window:AddTab(opts)
 
 	self:_renderStatusTabs()
 	if not self.CurrentTab then self:SelectTab(tab) end
+	if self.SearchBox.Text ~= "" then self:_applySearch(self.SearchBox.Text) end
 	return tab
 end
 Window.CreateTab = Window.AddTab
+Window.Tab = Window.AddTab
+
+function Window:RemoveTab(tab)
+	if type(tab) ~= "table" then tab = self:GetTab(tab) end
+	if tab and tab._window == self then tab:Destroy() end
+end
+
+function Tab:Destroy()
+	if self._destroyed then return end
+	self._destroyed = true
+	local window = self._window
+	for _, el in ipairs(Util.copy(self._elements)) do el:Destroy() end
+	self._sections = {}
+	local idx = Util.find(window.Tabs, self)
+	if idx then table.remove(window.Tabs, idx) end
+	self.TabButton:Destroy()
+	self.Page:Destroy()
+	if window.CurrentTab == self then
+		window.CurrentTab = nil
+		window:_closePopup()
+		local nextTab = window.Tabs[math.min(idx or 1, #window.Tabs)]
+		if nextTab then
+			window:SelectTab(nextTab)
+		else
+			window.TabDescLabel.Text = ""
+			window:_renderPath(false)
+		end
+	end
+	window:_renderStatusTabs()
+end
+Tab.Remove = Tab.Destroy
+
+-- two-column tabs: sections go into a left or right column; narrow windows stack the columns
+local COLUMN_MIN_W = 280
+
+function Window:_relayoutColumns()
+	local wide = (self.Width - SIDEBAR_W - 28) >= COLUMN_MIN_W * 2 + 8
+	for _, tab in ipairs(self.Tabs) do
+		local cols = tab._columnFrames
+		if cols then
+			cols.Layout.FillDirection = wide and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical
+			local size = wide and UDim2.new(0.5, -4, 0, 0) or UDim2.new(1, 0, 0, 0)
+			cols.Left.Size, cols.Right.Size = size, size
+		end
+	end
+end
+
+function Tab:_column(side)
+	if not self._columnFrames then
+		local holder = New("Frame", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			LayoutOrder = self:_nextOrder(),
+			Parent = self.Page,
+		})
+		local layout = List(holder, 8, Enum.FillDirection.Horizontal)
+		layout.VerticalAlignment = Enum.VerticalAlignment.Top
+		local function column(order)
+			local col = New("Frame", {
+				Size = UDim2.new(0.5, -4, 0, 0),
+				AutomaticSize = Enum.AutomaticSize.Y,
+				BackgroundTransparency = 1,
+				LayoutOrder = order,
+				Parent = holder,
+			})
+			List(col, 8)
+			return col
+		end
+		self._columnFrames = { Holder = holder, Layout = layout, Left = column(1), Right = column(2), Next = "left" }
+		self._window:_relayoutColumns()
+	end
+	local cols = self._columnFrames
+	side = string.lower(tostring(side or ""))
+	if side ~= "left" and side ~= "right" then side = cols.Next end -- no side given: alternate
+	cols.Next = side == "left" and "right" or "left"
+	return side == "left" and cols.Left or cols.Right
+end
 
 function Window:GetTab(nameOrIndex)
 	if type(nameOrIndex) == "number" then return self.Tabs[nameOrIndex] end
@@ -2083,6 +2310,7 @@ end
 function Window:SelectTab(tab)
 	if type(tab) ~= "table" then tab = self:GetTab(tab) end
 	if not tab or tab == self.CurrentTab or tab._window ~= self then return end
+	self:_closePopup()
 	local old = self.CurrentTab
 	self.CurrentTab = tab
 	if old then
@@ -2101,25 +2329,31 @@ function Window:SelectTab(tab)
 	self:_applySearch(self.SearchBox.Text)
 end
 
+local function searchMatch(el, query)
+	if string.find(string.lower(el._searchText or ""), query, 1, true) then return true end
+	return el._section ~= nil and string.find(string.lower(el._section.Name), query, 1, true) ~= nil
+end
+
+-- filters every tab at once; the sidebar shows how many hits each tab has
 function Window:_applySearch(query)
-	local tab = self.CurrentTab
-	if not tab then return end
 	query = string.lower(query or "")
 	local searching = query ~= ""
-	for _, el in ipairs(tab._elements) do
-		local match = not searching
-		if searching then
-			match = string.find(string.lower(el._searchText or ""), query, 1, true) ~= nil
-			if not match and el._section then
-				match = string.find(string.lower(el._section.Name), query, 1, true) ~= nil
+	for _, tab in ipairs(self.Tabs) do
+		local hits = 0
+		for _, el in ipairs(tab._elements) do
+			if not el._addon then -- add-ons follow the element they sit on
+				local match = not searching or searchMatch(el, query)
+				el._searchHidden = not match
+				el:_updateVisibility()
+				if searching and match and el._visible then hits = hits + 1 end
 			end
 		end
-		el._searchHidden = not match
-		el:_updateVisibility()
-	end
-	for _, sec in ipairs(tab._sections) do
-		sec._searching = searching
-		sec:_updateVisibility()
+		for _, sec in ipairs(tab._sections) do
+			sec._searching = searching
+			sec:_updateVisibility()
+		end
+		tab._searchHits = searching and hits or nil
+		tab._render(true)
 	end
 end
 
@@ -2133,9 +2367,9 @@ function Tab:Select()
 end
 
 --------------------------------------------------------------- sections
-function Tab:AddSection(opts)
-	if type(opts) == "string" then opts = { Name = opts } end
-	opts = opts or {}
+-- Tab:AddSection("combat")  /  Tab:AddSection("combat", "Right")  /  Tab:AddSection({ Name, Side, Collapsed })
+function Tab:AddSection(opts, side)
+	if type(opts) ~= "table" then opts = { Name = opts, Side = side } end
 	local window = self._window
 
 	local sec = setmetatable({}, Section)
@@ -2154,7 +2388,7 @@ function Tab:AddSection(opts)
 		AutomaticSize = Enum.AutomaticSize.Y,
 		LayoutOrder = self:_nextOrder(),
 		Theme = { BackgroundColor3 = "Panel" },
-		Parent = self.Page,
+		Parent = self.Columns == 2 and self:_column(opts.Side) or self.Page,
 	})
 	Corner(frame, 4)
 	Stroke(frame, "Border")
@@ -2218,6 +2452,7 @@ function Tab:AddSection(opts)
 	return sec
 end
 Tab.CreateSection = Tab.AddSection
+Tab.Section = Tab.AddSection
 
 function Section:_nextOrder()
 	self._order = self._order + 1
@@ -2363,6 +2598,8 @@ local function register(owner, el, opts)
 	el.Name = tostring(opts.Name or opts.Title or el.Name or el.Type)
 	el._searchText = el._searchText or el.Name
 	el.Callback = opts.Callback
+	el._addon = opts._Addon == true -- toggle add-ons: shown/hidden together with their toggle
+	if opts.IgnoreConfig then el.IgnoreConfig = true end
 	table.insert(owner._tab._elements, el)
 	table.insert(window._elements, el)
 	if el._section then table.insert(el._section._elements, el) end
@@ -2376,14 +2613,28 @@ local function register(owner, el, opts)
 		Cipher.Options[flag] = el
 		Cipher.Flags[flag] = el.Value
 		window._flags[flag] = el
+		-- a config loaded before this element existed (AutoLoadConfig) left its value waiting here
+		local pending = Cipher._pendingFlags
+		if pending and pending[flag] ~= nil and el._deserialize and not el.IgnoreConfig then
+			local value = pending[flag]
+			pending[flag] = nil
+			pcall(el._deserialize, el, value)
+		end
 	end
 	if opts.Tooltip then Tooltip.attach(el.Frame, opts.Tooltip) end
 	if opts.Locked then el:Lock(type(opts.Locked) == "string" and opts.Locked or nil) end
 	if opts.Visible == false then el:SetVisible(false) end
-	if window.SearchBox and window.SearchBox.Text ~= "" and window.CurrentTab == el._tab then
+	if window.SearchBox and window.SearchBox.Text ~= "" then
 		window:_applySearch(window.SearchBox.Text)
 	end
 	return el
+end
+
+-- a connection owned by one element: dropped by element:Destroy() and still by window:Destroy()
+local function trackFor(el, window, conn)
+	el._connections = el._connections or {}
+	table.insert(el._connections, conn)
+	return track(conn, window._connections)
 end
 
 function Element:_fire(value)
@@ -2400,7 +2651,7 @@ end
 
 function Element:_updateVisibility()
 	if self.Frame then
-		self.Frame.Visible = self._visible and not self._searchHidden
+		self.Frame.Visible = self._visible and (self._addon or not self._searchHidden)
 	end
 end
 
@@ -2466,7 +2717,10 @@ end
 function Element:Destroy()
 	if self._destroyed then return end
 	self._destroyed = true
+	for _, addon in ipairs(self._addons or {}) do addon:Destroy() end
 	if self._cleanup then pcall(self._cleanup, self) end
+	for _, conn in ipairs(self._connections or {}) do pcall(function() conn:Disconnect() end) end
+	self._connections = nil
 	local function remove(list)
 		if not list then return end
 		local i = Util.find(list, self)
@@ -2485,16 +2739,66 @@ end
 
 local ElementTypes = {}
 
+-- The short way to write elements: plain arguments instead of an options table.
+--   tab:Button("Kill all", function() end)
+--   tab:Toggle("Fly", false, function(on) end)
+--   tab:Slider("Speed", 16, 200, 16, function(v) end)
+-- A function argument is always the Callback (wherever it is); the other arguments fill these
+-- keys in order, and anything can be skipped: tab:Toggle("Fly", function(on) end) works too.
+local POSITIONAL = {
+	Button      = { "Name" },
+	Toggle      = { "Name", "Default" },
+	Slider      = { "Name", "Min", "Max", "Default" },
+	Dropdown    = { "Name", "Options", "Default" },
+	Input       = { "Name", "Placeholder", "Default" },
+	Textbox     = { "Name", "Placeholder", "Default" },
+	TextBox     = { "Name", "Placeholder", "Default" },
+	Keybind     = { "Name", "Default" },
+	ColorPicker = { "Name", "Default" },
+	Label       = { "Text" },
+	Paragraph   = { "Title", "Content" },
+	Divider     = { "Text" },
+	Console     = { "Name" },
+}
+
+local function buildOpts(kind, ...)
+	local first = ...
+	if typeof(first) == "table" then return first end
+	local keys = POSITIONAL[kind] or { "Name" }
+	local opts, i = {}, 0
+	for n = 1, select("#", ...) do
+		local v = select(n, ...)
+		if type(v) == "function" then
+			opts.Callback = v
+		else
+			i = i + 1
+			if keys[i] and v ~= nil then opts[keys[i]] = v end
+		end
+	end
+	-- tab:Dropdown("Pick", { "a", "b", "c" }, { "a" }, fn): a list as the default means multi-select
+	if kind == "Dropdown" and type(opts.Default) == "table" then opts.Multi = true end
+	return opts
+end
+
 local function defineElement(name, builder)
 	ElementTypes[name] = builder
-	local fn = function(owner, opts)
-		if type(opts) ~= "table" then opts = { Name = opts } end
-		return builder(owner, opts)
+	local fn = function(owner, ...)
+		return builder(owner, buildOpts(name, ...))
 	end
-	Tab["Add" .. name] = fn
-	Tab["Create" .. name] = fn
-	Section["Add" .. name] = fn
-	Section["Create" .. name] = fn
+	for _, class in ipairs({ Tab, Section }) do
+		class["Add" .. name] = fn
+		class["Create" .. name] = fn
+		local existing = rawget(class, name)
+		if existing == nil then
+			class[name] = fn -- short form: tab:Button(...)
+		else
+			-- section:Toggle() with no arguments still collapses / expands the section
+			class[name] = function(self, ...)
+				if select("#", ...) == 0 then return existing(self) end
+				return fn(self, ...)
+			end
+		end
+	end
 end
 
 --============================================================
@@ -2633,7 +2937,33 @@ defineElement("Toggle", function(owner, opts)
 		Parent = row,
 	})
 
+	-- add-ons (toggle:AddKeybind / toggle:AddColorPicker) line up left of the true/false label
+	local addonHolder = New("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -100, 0.5, 0),
+		Size = UDim2.fromOffset(0, 20),
+		AutomaticSize = Enum.AutomaticSize.X,
+		BackgroundTransparency = 1,
+		Parent = row,
+	})
+	local addonLayout = List(addonHolder, 6, Enum.FillDirection.Horizontal)
+	addonLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+	addonLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+	el._addonHolder = addonHolder
+	el._addons = {}
+	addonHolder:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		-- keep the title clear of the add-ons
+		local scale = math.max(owner._window.UIScale.Scale, 0.05)
+		local extra = addonHolder.AbsoluteSize.X / scale
+		local w = 24 + 96 + (extra > 0 and extra + 8 or 0)
+		title.Size = UDim2.new(1, -w, 0, title.Size.Y.Offset)
+		if desc then desc.Size = UDim2.new(1, -w, 0, desc.Size.Y.Offset) end
+	end)
+
 	function el:_render(instant)
+		for _, addon in ipairs(self._addons) do
+			if addon._syncToggle then addon:_syncToggle() end
+		end
 		local t = Cipher.Theme
 		local on = self.Value
 		local goals = {
@@ -2828,12 +3158,12 @@ defineElement("Slider", function(owner, opts)
 		end)
 	end)
 	local window = owner._window
-	track(UserInputService.InputChanged:Connect(function(input)
+	trackFor(el, window, UserInputService.InputChanged:Connect(function(input)
 		if dragging and isMove(input) then setFromX(input.Position.X) end
-	end), window._connections)
-	track(UserInputService.InputEnded:Connect(function(input)
+	end))
+	trackFor(el, window, UserInputService.InputEnded:Connect(function(input)
 		if isPointer(input) then stopDrag() end
-	end), window._connections)
+	end))
 
 	valueBox.Focused:Connect(function()
 		valueBox.Text = Util.formatNumber(el.Value, el.Increment)
@@ -3200,15 +3530,16 @@ defineElement("Dropdown", function(owner, opts)
 		end
 		options = names()
 		local window = owner._window
-		track(Players.PlayerAdded:Connect(function() el:Refresh(names()) end), window._connections)
-		track(Players.PlayerRemoving:Connect(function(plr)
+		trackFor(el, window, Players.PlayerAdded:Connect(function() el:Refresh(names()) end))
+		trackFor(el, window, Players.PlayerRemoving:Connect(function(plr)
 			task.defer(function()
+				if el._destroyed then return end
 				local list = names()
 				local i = Util.find(list, plr.Name)
 				if i then table.remove(list, i) end
 				el:Refresh(list)
 			end)
-		end), window._connections)
+		end))
 	end
 
 	el:Refresh(options)
@@ -3227,7 +3558,9 @@ end)
 local Input = newClass()
 
 local function buildInput(owner, opts)
-	local width = Util.clamp(tonumber(opts.Width) or 170, 60, 320)
+	-- two-column tabs are narrower, so the box gets a smaller default
+	local defaultWidth = (owner._tab and owner._tab.Columns == 2) and 120 or 170
+	local width = Util.clamp(tonumber(opts.Width) or defaultWidth, 60, 320)
 	local row, title, desc, stroke = createRow(owner, opts, ROW_H, width + 4, false)
 	local el = setmetatable({ Type = "Input", Frame = row, _titleLabel = title, _descLabel = desc, Numeric = opts.Numeric == true }, Input)
 	local finished = opts.Finished ~= false
@@ -3347,6 +3680,43 @@ local function normalizeMode(mode)
 	return "Toggle"
 end
 
+-- shared by Keybind elements and toggle keybind add-ons ------------------------------
+
+-- the window hands the next input to whatever keybind is listening
+local function captureKey(kb, input, key)
+	kb.Listening = false
+	local uit = input.UserInputType
+	if uit == Enum.UserInputType.MouseButton1 or uit == Enum.UserInputType.MouseButton2 then
+		-- this press ends listening; its release must not also hit the row's click handlers
+		-- (binding MB2 over the row used to be wiped instantly by the right-click-to-clear)
+		kb._mouseCapturedAt = os.clock()
+	end
+	if key == Enum.KeyCode.Escape then
+		-- cancelled
+	elseif key == Enum.KeyCode.Backspace or key == Enum.KeyCode.Delete then
+		kb:Set(nil)
+	elseif uit == Enum.UserInputType.Keyboard or uit == Enum.UserInputType.MouseButton2
+		or uit == Enum.UserInputType.MouseButton3 or string.find(uit.Name, "Gamepad", 1, true) then
+		kb:Set(key)
+	end
+	kb:_render()
+end
+
+local function justCaptured(kb)
+	return kb._mouseCapturedAt ~= nil and os.clock() - kb._mouseCapturedAt < 0.6
+end
+
+local function beginListening(window, kb)
+	if window._listening and window._listening ~= kb then
+		local other = window._listening
+		other.Listening = false
+		other:_render()
+	end
+	kb.Listening = true
+	window._listening = kb
+	kb:_render()
+end
+
 defineElement("Keybind", function(owner, opts)
 	local window = owner._window
 	local row, title, desc, stroke = createRow(owner, opts, ROW_H, 110, true)
@@ -3400,7 +3770,7 @@ defineElement("Keybind", function(owner, opts)
 				tween(g[1], 0.2, g[2])
 			end
 		end
-		if window._refreshKeybindList then window:_refreshKeybindList() end
+		window:_queueKeybindList()
 	end
 	onTheme(badge, function(_, instant) el:_render(instant) end)
 
@@ -3410,16 +3780,25 @@ defineElement("Keybind", function(owner, opts)
 	end
 
 	function el:Set(key, silent)
-		self.Value = Util.parseKey(key)
+		local newKey = Util.parseKey(key)
+		if self.Mode == "Hold" and self.State and newKey ~= self.Value then
+			-- the old key's release will never match again, so let go now instead of sticking on
+			self.State = false
+			fireState(false)
+		end
+		self.Value = newKey
 		if self.Flag then Cipher.Flags[self.Flag] = self.Value end
 		self:_render()
 		if not silent then safeCall(opts.ChangedCallback, self.Value) end
 	end
 
 	function el:SetMode(mode)
+		local wasOn = self.State
 		self.Mode = normalizeMode(mode)
 		self.State = false
 		self:_render()
+		-- tell the callback, or a held / toggled-on feature keeps running while the ui says off
+		if wasOn then fireState(false) end
 	end
 
 	function el:SetState(state)
@@ -3457,19 +3836,7 @@ defineElement("Keybind", function(owner, opts)
 		end
 	end
 
-	function el:_capture(input, key)
-		self.Listening = false
-		local uit = input.UserInputType
-		if key == Enum.KeyCode.Escape then
-			-- cancelled
-		elseif key == Enum.KeyCode.Backspace or key == Enum.KeyCode.Delete then
-			self:Set(nil)
-		elseif uit == Enum.UserInputType.Keyboard or uit == Enum.UserInputType.MouseButton2
-			or uit == Enum.UserInputType.MouseButton3 or string.find(uit.Name, "Gamepad", 1, true) then
-			self:Set(key)
-		end
-		self:_render()
-	end
+	el._capture = captureKey
 
 	function el:_serialize()
 		return self.Value and self.Value.Name or "none"
@@ -3478,21 +3845,19 @@ defineElement("Keybind", function(owner, opts)
 
 	function el:_cleanup()
 		if window._listening == self then window._listening = nil end
+		if self.Mode == "Hold" and self.State then
+			self.State = false
+			fireState(false)
+		end
+		window:_queueKeybindList()
 	end
 
 	row.MouseButton1Click:Connect(function()
-		if el.Locked then return end
-		if window._listening and window._listening ~= el then
-			local other = window._listening
-			other.Listening = false
-			other:_render()
-		end
-		el.Listening = true
-		window._listening = el
-		el:_render()
+		if el.Locked or justCaptured(el) then return end
+		beginListening(window, el)
 	end)
 	row.MouseButton2Click:Connect(function()
-		if el.Locked then return end
+		if el.Locked or justCaptured(el) then return end
 		el:Set(nil)
 	end)
 
@@ -3507,6 +3872,7 @@ end)
 --============================================================
 local ColorPicker = newClass()
 local PICK_SIZE = 110
+local RAINBOW_INTERVAL = 1 / 20
 
 local function rainbowSequence()
 	local keys = {}
@@ -3675,6 +4041,7 @@ defineElement("ColorPicker", function(owner, opts)
 			rgbBox.Text = string.format("%d, %d, %d", math.floor(el.Value.R * 255 + 0.5), math.floor(el.Value.G * 255 + 0.5), math.floor(el.Value.B * 255 + 0.5))
 		end
 		rainbowBtn.Text = el.Rainbow and "[x] rainbow" or "[ ] rainbow"
+		if el._onRender then el._onRender(el.Value) end -- e.g. a toggle's colour swatch
 	end
 
 	local function commit(silent)
@@ -3690,7 +4057,10 @@ defineElement("ColorPicker", function(owner, opts)
 	function el:Set(color, silent)
 		color = Util.fromHex(color)
 		if not color then return end
-		hue, sat, val = color:ToHSV()
+		local h, s, v = color:ToHSV()
+		-- greys and black carry no hue; keep the current one so the hue bar doesn't snap to red
+		if s > 0 and v > 0 then hue = h end
+		sat, val = s, v
 		commit(silent)
 	end
 
@@ -3704,8 +4074,13 @@ defineElement("ColorPicker", function(owner, opts)
 		end
 		if state then
 			local speed = tonumber(opts.RainbowSpeed) or 0.15
+			local last = 0
 			rainbowConn = RunService.Heartbeat:Connect(function()
-				hue = (os.clock() * speed) % 1
+				-- ~20 updates a second looks smooth and skips most of the callback / theme work
+				local now = os.clock()
+				if now - last < RAINBOW_INTERVAL then return end
+				last = now
+				hue = (now * speed) % 1
 				if sat < 0.05 then sat = 1 end
 				if val < 0.05 then val = 1 end
 				commit()
@@ -3761,23 +4136,23 @@ defineElement("ColorPicker", function(owner, opts)
 		if isPointer(input) and not el.Locked then
 			if el.Rainbow then el:SetRainbow(false) end
 			draggingSV = true
-			updateSV(input.Position)
+			updateSV(screenPoint(input))
 		end
 	end)
 	hueBar.InputBegan:Connect(function(input)
 		if isPointer(input) and not el.Locked then
 			if el.Rainbow then el:SetRainbow(false) end
 			draggingHue = true
-			updateHue(input.Position)
+			updateHue(screenPoint(input))
 		end
 	end)
-	track(UserInputService.InputChanged:Connect(function(input)
+	trackFor(el, window, UserInputService.InputChanged:Connect(function(input)
 		if not isMove(input) then return end
-		if draggingSV then updateSV(input.Position) elseif draggingHue then updateHue(input.Position) end
-	end), window._connections)
-	track(UserInputService.InputEnded:Connect(function(input)
+		if draggingSV then updateSV(screenPoint(input)) elseif draggingHue then updateHue(screenPoint(input)) end
+	end))
+	trackFor(el, window, UserInputService.InputEnded:Connect(function(input)
 		if isPointer(input) then draggingSV, draggingHue = false, false end
-	end), window._connections)
+	end))
 
 	hexBox.FocusLost:Connect(function()
 		local c = Util.fromHex(hexBox.Text)
@@ -3817,6 +4192,205 @@ defineElement("ColorPicker", function(owner, opts)
 	if opts.Rainbow then el:SetRainbow(true) end
 	return register(owner, el, opts)
 end)
+
+--============================================================
+-- TOGGLE ADD-ONS (a keybind or colour picker living inside a toggle's row)
+--   local esp = tab:Toggle("ESP", function(on) end)
+--   esp:AddKeybind("E")                                   -- E flips the toggle
+--   esp:AddColorPicker(Color3.new(1, 0, 0), function(c) end)
+--============================================================
+-- toggle:AddKeybind("F")  /  toggle:AddKeybind("F", "Hold")  /  toggle:AddKeybind({ Default, Mode, Flag, ChangedCallback })
+function Toggle:AddKeybind(opts, mode)
+	if type(opts) ~= "table" then opts = { Default = opts, Mode = mode } end
+	local toggle, window = self, self._window
+
+	local badge = New("TextButton", {
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.fromOffset(0, 20),
+		BackgroundTransparency = 0,
+		TextSize = 11,
+		Weight = "Medium",
+		LayoutOrder = #self._addons + 1,
+		Theme = { BackgroundColor3 = "Background" },
+		Parent = self._addonHolder,
+	})
+	Corner(badge, 3)
+	Padding(badge, 0, 6, 0, 6)
+	New("UISizeConstraint", { MinSize = Vector2.new(28, 20), Parent = badge })
+	local badgeStroke = New("UIStroke", { Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Parent = badge })
+
+	-- Mode "Toggle" (default): the key flips the toggle. "Hold": on while the key is held.
+	local kb = setmetatable({
+		Type = "Keybind", Frame = badge, Mode = normalizeMode(opts.Mode), State = toggle.Value, Listening = false,
+	}, Keybind)
+	kb.Value = Util.parseKey(opts.Default or opts.Value)
+	kb._searchText = toggle.Name
+
+	function kb:_render(instant)
+		local t = Cipher.Theme
+		badge.Text = self.Listening and "..." or Util.keyName(self.Value)
+		local goals = {
+			{ badge, { TextColor3 = self.Listening and t.Warning or (self.Value and t.Accent or t.Muted) } },
+			{ badgeStroke, { Color = self.Listening and t.Accent or t.Border } },
+		}
+		for _, g in ipairs(goals) do
+			if instant then
+				for k, v in pairs(g[2]) do g[1][k] = v end
+			else
+				tween(g[1], 0.2, g[2])
+			end
+		end
+		window:_queueKeybindList()
+	end
+	onTheme(badge, function(_, instant) kb:_render(instant) end)
+
+	-- the keybind list shows the toggle's on/off state
+	function kb:_syncToggle()
+		self.State = toggle.Value
+		window:_queueKeybindList()
+	end
+
+	function kb:Set(key, silent)
+		self.Value = Util.parseKey(key)
+		if self.Flag then Cipher.Flags[self.Flag] = self.Value end
+		self:_render()
+		if not silent then safeCall(opts.ChangedCallback, self.Value) end
+	end
+	function kb:SetMode(newMode) self.Mode = normalizeMode(newMode) end
+	function kb:GetState() return toggle.Value end
+
+	function kb:_press(key)
+		if self.Value == nil or key ~= self.Value or self.Locked or toggle.Locked then return end
+		if self.Mode == "Hold" then toggle:Set(true) else toggle:Set(not toggle.Value) end
+	end
+	function kb:_release(key)
+		if self.Mode == "Hold" and key == self.Value and toggle.Value then toggle:Set(false) end
+	end
+	kb._capture = captureKey
+
+	function kb:_serialize() return self.Value and self.Value.Name or "none" end
+	function kb:_deserialize(v) self:Set(v) end
+	function kb:_cleanup()
+		if window._listening == self then window._listening = nil end
+		window:_queueKeybindList()
+	end
+
+	badge.MouseButton1Click:Connect(function()
+		if kb.Locked or toggle.Locked or justCaptured(kb) then return end
+		beginListening(window, kb)
+	end)
+	badge.MouseButton2Click:Connect(function()
+		if kb.Locked or toggle.Locked or justCaptured(kb) then return end
+		kb:Set(nil)
+	end)
+
+	table.insert(window.Keybinds, kb)
+	table.insert(self._addons, kb)
+	kb:_render(true)
+	local regOpts = Util.copy(opts)
+	regOpts.Name = opts.Name or toggle.Name
+	regOpts._Addon = true
+	return register({ _window = window, _tab = toggle._tab }, kb, regOpts)
+end
+
+local POPUP_W = 300
+
+-- toggle:AddColorPicker(Color3.new(1, 0, 0), function(c) end)  /  toggle:AddColorPicker({ Default, Flag, Callback, Rainbow })
+function Toggle:AddColorPicker(opts, callback)
+	if type(opts) == "function" then opts, callback = nil, opts end
+	if typeof(opts) ~= "table" then opts = { Default = opts, Callback = callback } end
+	local toggle, window = self, self._window
+
+	local swatch = New("TextButton", {
+		Size = UDim2.fromOffset(24, 14),
+		BackgroundTransparency = 0,
+		LayoutOrder = #self._addons + 1,
+		Parent = self._addonHolder,
+	})
+	Corner(swatch, 3)
+	Stroke(swatch, "Border")
+
+	-- the full picker opens in a floating panel over the window; clicking anywhere else closes it
+	local catcher = New("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Visible = false,
+		ZIndex = 34,
+		Parent = window.Canvas,
+	})
+	local popup = New("Frame", {
+		Size = UDim2.fromOffset(POPUP_W, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Visible = false,
+		ZIndex = 35,
+		Theme = { BackgroundColor3 = "Panel" },
+		Parent = window.Canvas,
+	})
+	Corner(popup, 4)
+	Stroke(popup, "AccentDim")
+	Padding(popup, 6, 6, 6, 6)
+	List(popup, 0)
+
+	local pickerOpts = Util.copy(opts)
+	pickerOpts.Name = opts.Name or (toggle.Name .. " colour")
+	pickerOpts._Addon = true
+	local picker = ElementTypes.ColorPicker({
+		_window = window,
+		_tab = toggle._tab,
+		_container = popup,
+		_nextOrder = function() return 1 end,
+	}, pickerOpts)
+	picker._searchText = toggle.Name
+	picker._onRender = function(color) swatch.BackgroundColor3 = color end
+	swatch.BackgroundColor3 = picker.Value
+
+	local popupState = {}
+	local baseClose = picker.Close
+	function popupState.Close()
+		popup.Visible = false
+		catcher.Visible = false
+		baseClose(picker)
+		if window._popup == popupState then window._popup = nil end
+	end
+	-- the picker's own header (and Lock) close the whole popup
+	function picker:Close() popupState.Close() end
+
+	local function open()
+		window:_closePopup()
+		local s = math.max(window.UIScale.Scale, 0.05)
+		local rel = (swatch.AbsolutePosition - window.Canvas.AbsolutePosition) / s
+		local size = swatch.AbsoluteSize / s
+		local h = 190 -- opened picker + padding (upper bound)
+		local x = Util.clamp(rel.X + size.X - POPUP_W, 8, math.max(8, window.Width - POPUP_W - 8))
+		local y = rel.Y + size.Y + 6
+		if y + h > window.Height - STATUS_H then
+			y = math.max(TOPBAR_H + 4, rel.Y - h - 6) -- no room below: open upwards
+		end
+		popup.Position = UDim2.fromOffset(x, y)
+		popup.Visible = true
+		catcher.Visible = true
+		picker:Open()
+		window._popup = popupState
+	end
+
+	swatch.MouseButton1Click:Connect(function()
+		if toggle.Locked or picker.Locked then return end
+		if popup.Visible then popupState.Close() else open() end
+	end)
+	catcher.MouseButton1Click:Connect(popupState.Close)
+
+	local baseCleanup = picker._cleanup
+	function picker:_cleanup()
+		if baseCleanup then baseCleanup(self) end
+		if window._popup == popupState then window._popup = nil end
+		swatch:Destroy()
+		catcher:Destroy()
+		popup:Destroy()
+	end
+
+	table.insert(self._addons, picker)
+	return picker
+end
 
 --============================================================
 -- LABEL
@@ -4135,6 +4709,8 @@ end)
 function Window:Dialog(opts)
 	opts = opts or {}
 	if self._dialog then self._dialog:Close() end
+	-- a minimized window clips the canvas, which would hide the dialog completely
+	if self.Minimized then self:SetMinimized(false) end
 
 	local overlay = New("TextButton", {
 		Size = UDim2.fromScale(1, 1),
@@ -4409,6 +4985,7 @@ function Window:ToggleTerminal(state)
 	self._termAnim = (self._termAnim or 0) + 1
 	local id = self._termAnim
 	if state then
+		if self.Minimized then self:SetMinimized(false) end
 		term.Panel.Visible = true
 		tween(term.Panel, 0.35, { Position = UDim2.new(0, 0, 1, 0) })
 		task.delay(0.05, function()
@@ -4531,7 +5108,9 @@ function Window:_registerBuiltinCommands()
 		local flag = table.remove(args, 1)
 		local el = flagElement(con, flag)
 		if not el or not el.Set then return end
-		el:Set(parseForElement(el, args))
+		local value = parseForElement(el, args)
+		if value == nil then con:Error("invalid value for " .. string.lower(el.Type) .. " '" .. flag .. "'") return end
+		el:Set(value)
 		con:Success(flag .. " = " .. describeValue(el.Value))
 	end })
 	self:AddCommand({ Name = "toggle", Description = "flip a toggle flag", Usage = "toggle <flag>", Callback = function(args, con)
@@ -4663,13 +5242,23 @@ function Window:SetKeybindList(state)
 		List(body, 2)
 		makeDraggable(header, frame, self._connections)
 		self._kbList = { Frame = frame, Body = body }
-		onTheme(frame, function() self:_refreshKeybindList() end)
+		onTheme(frame, function() self:_queueKeybindList() end)
 	end
 	if self._kbList then
 		self._kbList.Frame.Visible = state
 		self.KeybindListVisible = state
 		self:_refreshKeybindList()
 	end
+end
+
+-- many keybinds can re-render in one frame (theme change, rainbow accent); rebuild the list once
+function Window:_queueKeybindList()
+	if self._kbListQueued or not self._kbList then return end
+	self._kbListQueued = true
+	task.defer(function()
+		self._kbListQueued = false
+		if not self.Destroyed then self:_refreshKeybindList() end
+	end)
 end
 
 function Window:_refreshKeybindList()
@@ -4770,9 +5359,20 @@ function Cipher:SaveConfig(name)
 			if ok then flags[flag] = { Type = el.Type, Value = value } end
 		end
 	end
+	-- per-window interface settings, keyed by window title
+	local windows = {}
+	for _, win in ipairs(self.Windows) do
+		windows[win.Title] = { ToggleKey = win.ToggleKey and win.ToggleKey.Name or "none", Scale = win._userScale }
+	end
 	ensureFolder(self:_configDir())
 	local ok, encoded = pcall(function()
-		return HttpService:JSONEncode({ Version = self.Version, Theme = self.ThemeName, Flags = flags })
+		return HttpService:JSONEncode({
+			Version = self.Version,
+			Theme = self.ThemeName,
+			Accent = Util.toHex(self.Theme.Accent),
+			Windows = windows,
+			Flags = flags,
+		})
 	end)
 	if not ok then return false, "could not encode config" end
 	local wrote, err = pcall(FS.writefile, self:_configDir() .. "/" .. name .. ".json", encoded)
@@ -4794,14 +5394,36 @@ function Cipher:LoadConfig(name)
 
 	local flags = type(decoded.Flags) == "table" and decoded.Flags or decoded
 	local loaded = 0
+	-- values for elements that don't exist yet wait here; register() applies them on creation
+	self._pendingFlags = {}
 	for flag, entry in pairs(flags) do
-		local el = self.Options[flag]
-		if el and el._deserialize and type(entry) == "table" and not el.IgnoreConfig then
-			if pcall(el._deserialize, el, entry.Value) then loaded = loaded + 1 end
+		if type(entry) == "table" then
+			local el = self.Options[flag]
+			if el then
+				if el._deserialize and not el.IgnoreConfig and pcall(el._deserialize, el, entry.Value) then
+					loaded = loaded + 1
+				end
+			elseif entry.Value ~= nil then
+				self._pendingFlags[flag] = entry.Value
+			end
+		end
+	end
+	if type(decoded.Windows) == "table" then
+		for _, win in ipairs(self.Windows) do
+			local saved = decoded.Windows[win.Title]
+			if type(saved) == "table" then
+				if type(saved.ToggleKey) == "string" then win:SetToggleKey(saved.ToggleKey) end
+				if tonumber(saved.Scale) then win:SetScale(tonumber(saved.Scale)) end
+			end
 		end
 	end
 	if type(decoded.Theme) == "string" and self.Themes[decoded.Theme] and decoded.Theme ~= self.ThemeName then
 		self:SetTheme(decoded.Theme)
+	end
+	-- custom accent (from SetAccent / the settings colour picker); absent in pre-1.1 configs
+	local accent = Util.fromHex(decoded.Accent)
+	if accent and Util.toHex(accent) ~= Util.toHex(self.Theme.Accent) then
+		self:SetAccent(accent)
 	end
 	return true, loaded
 end
@@ -4860,7 +5482,7 @@ end
 -- SETTINGS TAB (ready-made)
 --============================================================
 function Window:AddSettingsTab(opts)
-	opts = opts or {}
+	if type(opts) ~= "table" then opts = { Name = opts } end
 	local win = self
 	local tab = self:AddTab({ Name = opts.Name or "settings", Icon = opts.Icon, Description = "interface, configs & system info" })
 
@@ -4879,14 +5501,22 @@ function Window:AddSettingsTab(opts)
 		Default = Cipher.Theme.Accent,
 		Callback = function(color) Cipher:SetAccent(color, true) end,
 	})
-	Cipher:OnThemeChanged(function(name, theme)
+	local themeConn = Cipher:OnThemeChanged(function(name, theme)
 		if win.Destroyed then return end
 		if themeDrop.Value ~= name and Util.find(Cipher.ThemeOrder, name) then themeDrop:Set(name, true) end
 		if not accentPicker.Rainbow and Util.toHex(accentPicker.Value) ~= Util.toHex(theme.Accent) then
 			accentPicker:Set(theme.Accent, true)
 		end
 	end)
-	ui:AddKeybind({
+	-- themes added later with Cipher:AddTheme show up in this dropdown too
+	table.insert(Cipher._themeDropdowns, themeDrop)
+	self:OnDestroy(function()
+		themeConn:Disconnect()
+		local i = Util.find(Cipher._themeDropdowns, themeDrop)
+		if i then table.remove(Cipher._themeDropdowns, i) end
+	end)
+	-- kept on the window so SetToggleKey / SetScale (and configs) keep these in sync
+	self._menuKeybind = ui:AddKeybind({
 		Name = "Menu Keybind",
 		Description = "shows / hides the window",
 		Default = self.ToggleKey,
@@ -4895,7 +5525,7 @@ function Window:AddSettingsTab(opts)
 	})
 	ui:AddToggle({ Name = "Keybind List", Default = false, Callback = function(v) win:SetKeybindList(v) end })
 	ui:AddToggle({ Name = "CRT Scanline", Default = self._sweep.Visible, Callback = function(v) win:SetScanline(v) end })
-	ui:AddSlider({ Name = "UI Scale", Min = 60, Max = 140, Default = 100, Increment = 5, Suffix = "%", Callback = function(v) win:SetScale(v / 100) end })
+	self._scaleSlider = ui:AddSlider({ Name = "UI Scale", Min = 60, Max = 140, Default = math.floor(self._userScale * 100 + 0.5), Increment = 5, Suffix = "%", Callback = function(v) win:SetScale(v / 100) end })
 	ui:AddButton({ Name = "Center Window", Callback = function() win:Center() end })
 	ui:AddButton({ Name = "Open Terminal", Callback = function() win:ToggleTerminal(true) end })
 	ui:AddButton({ Name = "Unload", Description = "destroys the ui and disconnects everything", Confirm = true, Callback = function() win:Destroy() end })
@@ -4964,6 +5594,7 @@ function Window:AddSettingsTab(opts)
 	})
 	return tab
 end
+Window.Settings = Window.AddSettingsTab
 
 --============================================================
 -- LIBRARY-LEVEL API
