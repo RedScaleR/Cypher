@@ -1,0 +1,31 @@
+name: check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Luau and selene
+        run: |
+          curl -fsSL -o luau.zip https://github.com/luau-lang/luau/releases/latest/download/luau-ubuntu.zip
+          unzip -q luau.zip -d "$HOME/luau"
+          curl -fsSL -o selene.zip https://github.com/Kampfkarren/selene/releases/download/0.27.1/selene-0.27.1-linux.zip
+          unzip -q selene.zip -d "$HOME/selene"
+          chmod +x "$HOME"/luau/* "$HOME/selene/selene"
+          echo "$HOME/luau" >> "$GITHUB_PATH"
+          echo "$HOME/selene" >> "$GITHUB_PATH"
+
+      # fails on anything that would stop the library from loading
+      - name: Syntax check
+        run: luau-compile --binary Cipher.lua > /dev/null
+
+      # fails on real problems (undefined globals, wrong API use); style warnings are printed only
+      - name: Lint
+        run: |
+          selene generate-roblox-std
+          selene --allow-warnings Cipher.lua

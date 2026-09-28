@@ -1,0 +1,32 @@
+---
+# selene standard library: Roblox plus the optional executor functions Cipher looks for
+base: roblox
+globals:
+  cloneref:
+    any: true
+  getgenv:
+    any: true
+  gethui:
+    any: true
+  identifyexecutor:
+    any: true
+  setclipboard:
+    any: true
+  toclipboard:
+    any: true
+  syn:
+    any: true
+  isfile:
+    any: true
+  isfolder:
+    any: true
+  readfile:
+    any: true
+  writefile:
+    any: true
+  makefolder:
+    any: true
+  listfiles:
+    any: true
+  delfile:
+    any: true

@@ -1,0 +1,9 @@
+std = "cipher"
+
+[lints]
+# house style: one-line guards (`if x then return end`) and a few intentional patterns
+multiple_statements = "allow"
+global_usage = "allow"       # _G is the fallback when getgenv is missing
+shadowing = "allow"          # `self` inside methods defined in other methods
+empty_if = "allow"           # the "cancelled" branch when capturing a key
+manual_table_clone = "allow" # Util.copy predates table.clone support in every executor
